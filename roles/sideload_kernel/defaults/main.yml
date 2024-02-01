@@ -1,0 +1,3 @@
+---
+sideload_kernel_namespace: default
+sideload_kernel_force: false

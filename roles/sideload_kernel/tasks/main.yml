@@ -1,0 +1,117 @@
+---
+- name: Validate required variables
+  ansible.builtin.assert:
+    that:
+      - sideload_kernel_uri | string
+
+- name: Install python dependencies
+  ansible.builtin.pip:
+    name:
+      - kubernetes
+
+- name: sideload-kernel job namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    api_version: v1
+    kind: Namespace
+    name: "{{ sideload_kernel_namespace }}"
+
+- name: sideload-kernel configmap
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    apply: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: sideload-kernel
+        namespace: "{{ sideload_kernel_namespace }}"
+      data:
+        KERNEL_URI: "{{ sideload_kernel_uri }}"
+        flip_kernel: "{{ lookup('file', 'flip_kernel') }}"
+  register: configmap_created
+
+- name: Clean out any previous jobs
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: flip-kernel
+    namespace: "{{ sideload_kernel_namespace }}"
+  when: configmap_created.changed or sideload_kernel_force | bool
+
+- name: sideload-kernel job
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: flip-kernel
+        namespace: "{{ sideload_kernel_namespace }}"
+      spec:
+        backoffLimit: 3
+        # TODO: Add a selector for multi-node cluster cases?
+        template:
+          spec:
+            containers:
+            - command:
+              - /bin/sh
+              args:
+              - "-c"
+              - "install /script/flip_kernel /host/tmp && chroot /host /tmp/flip_kernel ${KERNEL_URI}"
+              env:
+              - name: KERNEL_URI
+                valueFrom:
+                  configMapKeyRef:
+                    name: sideload-kernel
+                    key: KERNEL_URI
+              image: ubi9
+              imagePullPolicy: IfNotPresent
+              name: flipper
+              securityContext:
+                privileged: true
+                runAsUser: 0
+              volumeMounts:
+              - mountPath: /host
+                name: host
+              - mountPath: /script
+                name: script
+            hostIPC: true
+            hostNetwork: true
+            hostPID: true
+            restartPolicy: Never
+            volumes:
+            - name: host
+              hostPath:
+                path: /
+                type: Directory
+            - name: script
+              configMap:
+                name: sideload-kernel
+
+- ansible.builtin.debug:
+    msg: "Waiting for the job to reach a completed state (may take up to 15 mins)..."
+
+- name: Wait for job completion
+  kubernetes.core.k8s_info:
+    api_version: batch/v1
+    kind: Job
+    name: flip-kernel
+    namespace: "{{ sideload_kernel_namespace }}"
+    kubeconfig: "{{ kubeconfig }}"
+  register: job_state
+  until: not job_state.failed and "conditions" in job_state.resources[0].status and job_state.resources[0].status.conditions[0].status == "True"
+  # A successful job may take up to 15 mins, including waiting for a host reboot
+  retries: 60
+  delay: 15
+
+- name: Ensure the job completed successfully
+  ansible.builtin.fail:
+    msg: "Job state is {{ job_state.resources[0].status.conditions[0].type }}"
+  when: job_state.resources[0].status.conditions[0].type != 'Complete'
+...
